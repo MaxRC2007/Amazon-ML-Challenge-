@@ -1,7 +1,14 @@
 # --- Data (large, provided; never committed to the source freeze) ---
+dataset
 dataset/
+student_resource
+student_resource/
+output
 output/
+outputs
 outputs/
+checkpoints
+checkpoints/
 *.tsv
 
 # --- Model / run artifacts ---
@@ -20,12 +27,11 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
+.venv
 .venv/
 venv/
 *.egg-info/
 
 # --- OS cruft ---
 .DS_Store
-
-# --- Lock file is created on the lab machine after install (separate commit) ---
-requirements-lock.txt
+*.log

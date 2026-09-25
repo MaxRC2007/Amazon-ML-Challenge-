@@ -66,8 +66,25 @@ Prints `PASS` (exit 0) or numbered issues (exit 1). Run this after every pipelin
 | `src/normalization.py` | NFKC → unidecode → lowercase → suffix strip → token-sort |
 | `src/blocking.py` | Stage A classical blocking + gated Stage B embedding ANN |
 | `src/features.py` | 9 pairwise similarity features (Jaccard, Levenshtein, TF-IDF, etc.) |
-| `src/model.py` | LightGBM training + F_0.5-tuned threshold selection |
-| `src/pipeline.py` | Top-level orchestrator |
+| `src/model.py` | LightGBM training + tree-level checkpointing + F_0.5 threshold sweep |
+| `src/checkpoint.py` | Atomic Parquet / JSON / Pickle serialization for fault tolerance |
+| `src/pipeline.py` | Top-level orchestrator with step-level checkpointing & resume |
+
+## Checkpointing & Resuming (Fault-Tolerant Training)
+
+The pipeline incorporates end-to-end atomic checkpointing across all execution stages:
+
+- **Enabled by Default**: Any run automatically saves checkpoints to `output/checkpoints/` (or `--checkpoint-dir`).
+- **Resuming Interrupted Training**: If training or inference is stopped, simply re-run the exact same command. The pipeline detects existing checkpoints and resumes seamlessly:
+  - Already normalized datasets load in ~2 seconds (via PyArrow Parquet).
+  - Pre-computed inverted indexes, blocking candidate pairs, and TF-IDF vectors are restored.
+  - LightGBM model training resumes from the last completed booster iteration (checkpointed every `--checkpoint-freq` trees).
+  - Validation threshold and test inference states are saved to prevent duplicate work.
+- **Flags**:
+  - `--resume` (default `True`): Resume from checkpoints if available.
+  - `--no-resume`: Ignore checkpoints and recompute the full pipeline from scratch.
+  - `--checkpoint-freq N` (default `25`): Frequency (in trees) for saving LightGBM booster checkpoints.
+  - `--checkpoint-dir DIR`: Custom directory for storing pipeline checkpoints.
 
 ## Self-tests
 

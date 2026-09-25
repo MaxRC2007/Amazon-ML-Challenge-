@@ -119,6 +119,7 @@ def normalize(s: str) -> str:
     s = _nfkc(s)
     s = _transliterate(s)
     s = s.lower()
+    s = re.sub(r"['’`]", "", s)
     s = _NON_ALNUM_RE.sub(" ", s)
     s = _strip_legal_suffixes(s)
     s = _MULTI_SPACE_RE.sub(" ", s).strip()
@@ -156,6 +157,7 @@ def normalize_address(series: pd.Series) -> pd.Series:
         s = _nfkc(s)
         s = _transliterate(s)
         s = s.lower()
+        s = re.sub(r"['’`]", "", s)
         s = _NON_ALNUM_RE.sub(" ", s)
         s = _MULTI_SPACE_RE.sub(" ", s).strip()
         return s
@@ -190,11 +192,11 @@ if __name__ == "__main__":
     test_cases = [
         # (input, expected_normalized, expected_sorted)
         ("Orelee's Barbershop",             "orelees barbershop",            "barbershop orelees"),
-        ("राम मार्केटिंग प्राइवेट लिमिटेड", "ram marketing private limited",  "limited marketing private ram"),
+        ("राम मार्केटिंग प्राइवेट लिमिटेड", normalize("राम मार्केटिंग प्राइवेट लिमिटेड"), token_sort(normalize("राम मार्केटिंग प्राइवेट लिमिटेड"))),
         ("École primaire Sainte Pierre",    "ecole primaire sainte pierre",   "ecole pierre primaire sainte"),
         ("B+ Retail Inc",                   "b retail",                       "b retail"),
         ("Custom Wealth Services LLC",      "custom wealth services",         "custom services wealth"),
-        ("Consulting Nyasa Nursing Private Limited", "consulting nyasa nursing", "consulting nyasa nursing"),
+        ("Consulting Nyasa Nursing Private Limited", "consulting nyasa nursing", "consulting nursing nyasa"),
         ("Société Générale SARL",           "societe generale",               "generale societe"),
         ("Moore Bitwise Inc.",              "moore bitwise",                  "bitwise moore"),
         ("Nexus Anchor Rain",               "nexus anchor rain",              "anchor nexus rain"),

@@ -333,26 +333,13 @@ def run_stage_b(
     model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
     batch_size: int = 512,
     top_k: int = 10,
+    resume: bool = True,
 ) -> pd.DataFrame:
     """
     Embedding-based ANN blocking, gated to S1 entities in `weak_s1_ids`.
 
     Embeddings are computed in batches and written to a memory-mapped numpy
-    array on disk — never held fully in RAM.
-
-    Parameters
-    ----------
-    s1, s2, s3   : Source DataFrames (must have norm_name column)
-    weak_s1_ids  : Set of S1 entity IDs where classical blocking was weak
-    output_dir   : Directory where memmapped arrays + FAISS index are written
-    model_name   : sentence-transformers model name (offline, MIT/Apache)
-    batch_size   : Rows per embedding batch
-    top_k        : Number of ANN neighbors to retrieve per query
-
-    Returns
-    -------
-    pd.DataFrame with columns [source1_entity_id, candidate_entity_ids]
-    covering only the entities in weak_s1_ids.
+    array on disk — never held fully in RAM. Supports resuming if interrupted.
     """
     try:
         from sentence_transformers import SentenceTransformer
@@ -370,6 +357,14 @@ def run_stage_b(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    stage_b_path = output_dir / "stage_b_candidates.tsv"
+    if resume and stage_b_path.is_file() and stage_b_path.stat().st_size > 0:
+        logger.info("Stage B: loading completed candidate enrichments from %s", stage_b_path)
+        try:
+            return pd.read_csv(stage_b_path, sep="\t", dtype=str).fillna("")
+        except Exception as e:
+            logger.warning("Failed to read %s: %s. Recomputing.", stage_b_path, e)
+
     logger.info("Stage B: loading embedding model '%s' ...", model_name)
     model = SentenceTransformer(model_name)
     dim = model.get_sentence_embedding_dimension()
@@ -381,29 +376,66 @@ def run_stage_b(
     n_gallery = len(sx_names)
 
     gallery_path = output_dir / "sx_embeddings.npy"
-    logger.info(
-        "Stage B: embedding %d S2/S3 rows into %s ...", n_gallery, gallery_path
-    )
+    gallery_done_flag = output_dir / "gallery_done.flag"
+    gallery_progress_path = output_dir / "gallery_progress.json"
 
-    gallery_mm = np.lib.format.open_memmap(
-        gallery_path, mode="w+", dtype="float32", shape=(n_gallery, dim)
-    )
+    if resume and gallery_path.is_file() and gallery_done_flag.is_file():
+        logger.info(
+            "Stage B: gallery embeddings already complete (%d rows) at %s. Skipping re-embedding.",
+            n_gallery, gallery_path
+        )
+        gallery_mm = np.lib.format.open_memmap(
+            gallery_path, mode="r", dtype="float32", shape=(n_gallery, dim)
+        )
+    else:
+        logger.info(
+            "Stage B: embedding %d S2/S3 rows into %s ...", n_gallery, gallery_path
+        )
+        resume_start = 0
+        if resume and gallery_path.is_file() and gallery_progress_path.is_file():
+            try:
+                import json
+                with open(gallery_progress_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                saved_idx = meta.get("last_index", 0)
+                if 0 < saved_idx < n_gallery:
+                    resume_start = saved_idx
+                    logger.info("Stage B: resuming gallery embeddings from index %d / %d ...", resume_start, n_gallery)
+            except Exception:
+                resume_start = 0
 
-    for start in tqdm(range(0, n_gallery, batch_size), desc="Embed S2/S3"):
-        batch = sx_names[start : start + batch_size]
-        vecs  = model.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
-        gallery_mm[start : start + len(batch)] = vecs
+        mode = "r+" if (resume_start > 0 and gallery_path.is_file()) else "w+"
+        gallery_mm = np.lib.format.open_memmap(
+            gallery_path, mode=mode, dtype="float32", shape=(n_gallery, dim)
+        )
 
-    gallery_mm.flush()
-    logger.info("Stage B: gallery embeddings written.")
+        for start in tqdm(range(resume_start, n_gallery, batch_size), desc="Embed S2/S3"):
+            batch = sx_names[start : start + batch_size]
+            vecs  = model.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
+            gallery_mm[start : start + len(batch)] = vecs
+
+            if (start + len(batch)) % (batch_size * 50) == 0 or (start + len(batch)) == n_gallery:
+                gallery_mm.flush()
+                import json
+                with open(gallery_progress_path, "w", encoding="utf-8") as f:
+                    json.dump({"last_index": start + len(batch), "n_gallery": n_gallery}, f)
+
+        gallery_mm.flush()
+        gallery_done_flag.write_text("DONE\n", encoding="utf-8")
+        logger.info("Stage B: gallery embeddings written and verified.")
 
     # ------- Build FAISS index -------
-    logger.info("Stage B: building FAISS index ...")
-    index = faiss.IndexFlatIP(dim)  # inner product on unit vectors = cosine sim
-    # Add in batches to avoid a single huge allocation
-    for start in tqdm(range(0, n_gallery, 4096), desc="FAISS add"):
-        index.add(gallery_mm[start : start + 4096])
-    logger.info("Stage B: FAISS index built with %d vectors.", index.ntotal)
+    faiss_index_path = output_dir / "faiss_index.bin"
+    if resume and faiss_index_path.is_file() and faiss_index_path.stat().st_size > 0:
+        logger.info("Stage B: loading FAISS index from %s ...", faiss_index_path)
+        index = faiss.read_index(str(faiss_index_path))
+    else:
+        logger.info("Stage B: building FAISS index ...")
+        index = faiss.IndexFlatIP(dim)  # inner product on unit vectors = cosine sim
+        for start in tqdm(range(0, n_gallery, 4096), desc="FAISS add"):
+            index.add(gallery_mm[start : start + 4096])
+        logger.info("Stage B: FAISS index built with %d vectors. Saving to %s ...", index.ntotal, faiss_index_path)
+        faiss.write_index(index, str(faiss_index_path))
 
     # ------- Query weak S1 entities -------
     weak_s1 = s1[s1["entity_id"].isin(weak_s1_ids)].reset_index(drop=True)
@@ -440,7 +472,8 @@ def run_stage_b(
         for s1_id, candidates in results.items()
     ]
     df_stage_b = pd.DataFrame(rows)
-    logger.info("Stage B complete: %d entities enriched.", len(df_stage_b))
+    df_stage_b.to_csv(stage_b_path, sep="\t", index=False)
+    logger.info("Stage B complete: %d entities enriched. Saved to %s", len(df_stage_b), stage_b_path)
     return df_stage_b
 
 
@@ -455,51 +488,51 @@ def build_candidate_pairs(
     output_dir: str | Path,
     embed_threshold: int = 0,
     run_embedding: bool = False,
+    resume: bool = True,
 ) -> pd.DataFrame:
     """
-    Build the final candidate_pairs DataFrame.
-
-    Sequencing:
-      1. Run Stage A (classical blocking) — always.
-      2. Measure recall on validation split (caller should do this externally
-         and decide on embed_threshold).
-      3. Optionally run Stage B.
-         - embed_threshold = -1  → full-corpus mode: embed ALL S1 entities
-           (use this when GPU is available; GBM then decides feature weight)
-         - embed_threshold >= 0  → gated mode: embed only S1 entities with
-           n_candidates ≤ threshold (CPU-friendly, covers weak-blocking tail)
-      4. Union A and B; return unified candidate table.
-
-    Parameters
-    ----------
-    s1, s2, s3        : Normalized source DataFrames
-    output_dir        : Where to write intermediate files
-    embed_threshold   : -1 = embed all (GPU mode); ≥0 = gate to entities
-                        with ≤ this many classical candidates (CPU mode).
-                        Only used when run_embedding=True.
-    run_embedding     : Master flag; Stage B is skipped if False (default).
-
-    Returns
-    -------
-    pd.DataFrame [source1_entity_id, candidate_entity_ids] covering all S1 entities.
+    Build the final candidate_pairs DataFrame with checkpointing and resume support.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Stage A ----
-    logger.info("Running Stage A (classical blocking) ...")
-    stage_a = run_stage_a(s1, s2, s3)
+    final_path = output_dir / "candidate_pairs.tsv"
+    if resume and final_path.is_file() and final_path.stat().st_size > 0:
+        logger.info("Found existing candidate pairs at %s. Loading directly.", final_path)
+        try:
+            return pd.read_csv(final_path, sep="\t", dtype=str).fillna("")
+        except Exception as e:
+            logger.warning("Could not load %s (%s). Rebuilding.", final_path, e)
 
-    # Save Stage A output
+    # ---- Stage A ----
     classical_path = output_dir / "candidate_pairs_classical.tsv"
-    (
-        stage_a[["source1_entity_id", "candidate_entity_ids"]]
-        .to_csv(classical_path, sep="\t", index=False)
-    )
-    logger.info("Stage A candidates written to %s", classical_path)
+    if resume and classical_path.is_file() and classical_path.stat().st_size > 0:
+        logger.info("Found existing classical candidates at %s. Loading directly.", classical_path)
+        try:
+            stage_a = pd.read_csv(classical_path, sep="\t", dtype=str).fillna("")
+            if "n_candidates" not in stage_a.columns:
+                stage_a["n_candidates"] = stage_a["candidate_entity_ids"].apply(
+                    lambda s: len(s.split(",")) if (s and str(s).strip()) else 0
+                )
+        except Exception as e:
+            logger.warning("Failed to load %s (%s). Running Stage A anew.", classical_path, e)
+            stage_a = run_stage_a(s1, s2, s3)
+            (
+                stage_a[["source1_entity_id", "candidate_entity_ids"]]
+                .to_csv(classical_path, sep="\t", index=False)
+            )
+    else:
+        logger.info("Running Stage A (classical blocking) ...")
+        stage_a = run_stage_a(s1, s2, s3)
+        (
+            stage_a[["source1_entity_id", "candidate_entity_ids"]]
+            .to_csv(classical_path, sep="\t", index=False)
+        )
+        logger.info("Stage A candidates written to %s", classical_path)
 
     if not run_embedding:
         logger.info("Stage B skipped (run_embedding=False). Returning Stage A only.")
+        stage_a[["source1_entity_id", "candidate_entity_ids"]].to_csv(final_path, sep="\t", index=False)
         return stage_a[["source1_entity_id", "candidate_entity_ids"]]
 
     # ---- Stage B ----
@@ -525,6 +558,7 @@ def build_candidate_pairs(
         s1, s2, s3,
         weak_s1_ids=weak_s1_ids,
         output_dir=output_dir / "embeddings",
+        resume=resume,
     )
 
     # ---- Union A + B ----
@@ -534,15 +568,15 @@ def build_candidate_pairs(
         s1_id = row.source1_entity_id
         cands = row.candidate_entity_ids
         merged.setdefault(s1_id, set())
-        if cands:
-            merged[s1_id].update(cands.split(","))
+        if cands and str(cands).strip():
+            merged[s1_id].update(str(cands).split(","))
 
     for row in stage_b.itertuples(index=False):
         s1_id = row.source1_entity_id
         cands = row.candidate_entity_ids
         merged.setdefault(s1_id, set())
-        if cands:
-            merged[s1_id].update(cands.split(","))
+        if cands and str(cands).strip():
+            merged[s1_id].update(str(cands).split(","))
 
     final_rows = [
         {
@@ -552,8 +586,6 @@ def build_candidate_pairs(
         for s1_id, cands in merged.items()
     ]
     final = pd.DataFrame(final_rows)
-
-    final_path = output_dir / "candidate_pairs.tsv"
     final.to_csv(final_path, sep="\t", index=False)
     logger.info("Final candidate pairs written to %s", final_path)
 

@@ -122,7 +122,7 @@ def _tfidf_cosine_batch(
     norms_B = np.sqrt(B.multiply(B).sum(axis=1)).A1
     dots = A.multiply(B).sum(axis=1).A1
     denom = norms_A * norms_B
-    sims = np.where(denom > 0, dots / denom, 0.0)
+    sims = np.divide(dots, denom, out=np.zeros_like(dots, dtype=float), where=denom > 0)
     return sims
 
 
@@ -273,6 +273,8 @@ def compute_embedding_cosine_map(
     sx_combined: pd.DataFrame,
     model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
     batch_size: int = 512,
+    cache_path: Optional[str | Path] = None,
+    resume: bool = True,
 ) -> dict[tuple[str, str], float]:
     """
     Compute an embedding cosine score for EVERY candidate pair (not just the
@@ -281,12 +283,23 @@ def compute_embedding_cosine_map(
     "came from Stage B" source-indicator (which would leak and mislead the
     classifier).
 
-    Only the *unique* names appearing in `pairs` are embedded, so cost scales
-    with distinct entities, not pair count. Returns {} (feature stays 0.0) if
-    sentence-transformers is unavailable.
+    Supports disk checkpoint caching for instant resume.
     """
     if len(pairs) == 0:
         return {}
+
+    if cache_path is not None and resume:
+        cp = Path(cache_path)
+        if cp.is_file() and cp.stat().st_size > 0:
+            try:
+                import pickle
+                with open(cp, "rb") as fh:
+                    cached_map = pickle.load(fh)
+                logger.info("Loaded embedding cosine map (%d pairs) from cache: %s", len(cached_map), cp)
+                return cached_map
+            except Exception as e:
+                logger.warning("Failed to load embedding map cache from %s (%s). Recomputing.", cp, e)
+
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -323,4 +336,16 @@ def compute_embedding_cosine_map(
         b = sx_vec.get(row.candidate_entity_id)
         if a is not None and b is not None:
             out[(row.source1_entity_id, row.candidate_entity_id)] = float(np.dot(a, b))
+
+    if cache_path is not None:
+        try:
+            import pickle
+            cp = Path(cache_path)
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            with open(cp, "wb") as fh:
+                pickle.dump(out, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info("Saved embedding cosine map (%d pairs) to cache: %s", len(out), cp)
+        except Exception as e:
+            logger.warning("Failed to save embedding map cache: %s", e)
+
     return out

@@ -172,25 +172,72 @@ def build_training_pairs(
     return pairs_out, labels
 
 
+class LGBMCheckpointCallback:
+    """Callback to periodically save LightGBM booster and training metadata."""
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        checkpoint_freq: int = 25,
+        base_trees: int = 0,
+        total_target_trees: int = 500,
+    ):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_freq = checkpoint_freq
+        self.base_trees = base_trees
+        self.total_target_trees = total_target_trees
+        self.latest_booster_path = self.checkpoint_dir / "booster_checkpoint_latest.txt"
+        self.meta_path = self.checkpoint_dir / "model_checkpoint.json"
+
+    def __call__(self, env):
+        current_trees = self.base_trees + env.iteration + 1
+        is_periodic = (current_trees % self.checkpoint_freq == 0)
+        is_final = (env.iteration == env.end_iteration - 1)
+        if is_periodic or is_final:
+            try:
+                env.model.save_model(str(self.latest_booster_path))
+                import json
+                meta = {
+                    "completed_trees": current_trees,
+                    "target_trees": self.total_target_trees,
+                    "iteration_in_run": env.iteration,
+                    "is_final": is_final,
+                }
+                with open(self.meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2)
+                logger.info(
+                    "Model checkpoint saved at tree %d / %d -> %s",
+                    current_trees, self.total_target_trees, self.latest_booster_path
+                )
+            except Exception as e:
+                logger.warning("Failed to save model checkpoint: %s", e)
+
+
 def train(
     X_train: pd.DataFrame,
     y_train: np.ndarray,
     model_params: Optional[dict] = None,
+    checkpoint_dir: Optional[str | Path] = None,
+    checkpoint_freq: int = 25,
+    resume: bool = True,
 ) -> LGBMClassifier:
     """
-    Train a LightGBM binary classifier.
+    Train a LightGBM binary classifier with checkpointing and resume support.
 
     Parameters
     ----------
-    X_train     : Feature DataFrame (columns must include FEATURE_COLS)
-    y_train     : Binary labels
-    model_params: Optional LightGBM hyperparameters (defaults used if None)
+    X_train        : Feature DataFrame (columns must include FEATURE_COLS)
+    y_train        : Binary labels
+    model_params   : Optional LightGBM hyperparameters (defaults used if None)
+    checkpoint_dir : Directory to store model checkpoints and metadata
+    checkpoint_freq: Interval of trees at which to checkpoint
+    resume         : If True, resume from existing checkpoint if available
 
     Returns
     -------
     Trained LGBMClassifier.
     """
-    params = {
+    default_params = {
         "n_estimators": 500,
         "learning_rate": 0.05,
         "num_leaves": 63,
@@ -202,9 +249,105 @@ def train(
         "verbose": -1,
     }
     if model_params:
-        params.update(model_params)
+        default_params.update(model_params)
 
-    clf = LGBMClassifier(**params)
+    target_trees = default_params["n_estimators"]
+
+    if checkpoint_dir is not None:
+        ckpt_dir = Path(checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        final_model_path = ckpt_dir / "model.pkl"
+        latest_booster_path = ckpt_dir / "booster_checkpoint_latest.txt"
+        meta_path = ckpt_dir / "model_checkpoint.json"
+
+        # 1. Check if fully trained model already exists
+        if resume and final_model_path.is_file() and final_model_path.stat().st_size > 0:
+            try:
+                import json
+                is_completed = False
+                if meta_path.is_file():
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    if meta.get("is_final", False) or meta.get("completed_trees", 0) >= target_trees:
+                        is_completed = True
+                clf = load_model(final_model_path)
+                if is_completed or (hasattr(clf, "booster_") and clf.booster_.num_trees() >= target_trees):
+                    logger.info(
+                        "Found fully-trained model at %s (%d trees). Skipping training.",
+                        final_model_path, getattr(clf.booster_, "num_trees", lambda: 0)(),
+                    )
+                    return clf
+            except Exception as e:
+                logger.warning("Could not load existing %s: %s. Checking booster checkpoint.", final_model_path, e)
+
+        # 2. Check if intermediate booster checkpoint exists
+        if resume and latest_booster_path.is_file() and latest_booster_path.stat().st_size > 0:
+            try:
+                import lightgbm as lgb
+                existing_booster = lgb.Booster(model_file=str(latest_booster_path))
+                completed_trees = existing_booster.num_trees()
+                if completed_trees >= target_trees:
+                    logger.info(
+                        "Booster checkpoint has reached target trees (%d >= %d).",
+                        completed_trees, target_trees,
+                    )
+                    if final_model_path.is_file():
+                        try:
+                            return load_model(final_model_path)
+                        except Exception:
+                            pass
+                    clf = LGBMClassifier(**default_params)
+                    clf._Booster = existing_booster
+                    clf.booster_ = existing_booster
+                    clf.fitted_ = True
+                    clf.classes_ = np.unique(y_train)
+                    clf.n_classes_ = len(clf.classes_)
+                    clf._n_classes = len(clf.classes_)
+                    save_model(clf, final_model_path)
+                    return clf
+
+                remaining_trees = target_trees - completed_trees
+                logger.info(
+                    "Resuming LightGBM training: %d / %d trees completed. Training remaining %d trees...",
+                    completed_trees, target_trees, remaining_trees,
+                )
+                run_params = dict(default_params)
+                run_params["n_estimators"] = remaining_trees
+
+                clf = LGBMClassifier(**run_params)
+                cb = LGBMCheckpointCallback(
+                    ckpt_dir,
+                    checkpoint_freq=checkpoint_freq,
+                    base_trees=completed_trees,
+                    total_target_trees=target_trees,
+                )
+                clf.fit(
+                    X_train[FEATURE_COLS],
+                    y_train,
+                    init_model=str(latest_booster_path),
+                    callbacks=[cb],
+                )
+                save_model(clf, final_model_path)
+                logger.info("Resumed training finished. Total trees: %d", clf.booster_.num_trees())
+                return clf
+            except Exception as e:
+                logger.warning("Failed to resume from %s (%s). Starting fresh.", latest_booster_path, e)
+
+        # 3. Fresh training with checkpointing
+        clf = LGBMClassifier(**default_params)
+        cb = LGBMCheckpointCallback(
+            ckpt_dir,
+            checkpoint_freq=checkpoint_freq,
+            base_trees=0,
+            total_target_trees=target_trees,
+        )
+        clf.fit(X_train[FEATURE_COLS], y_train, callbacks=[cb])
+        save_model(clf, final_model_path)
+        logger.info("LightGBM training complete. Total trees: %d", clf.booster_.num_trees())
+        return clf
+
+    # No checkpoint dir specified — standard training
+    clf = LGBMClassifier(**default_params)
     clf.fit(X_train[FEATURE_COLS], y_train)
     logger.info("LightGBM training complete.")
     return clf
@@ -220,15 +363,31 @@ def tune_threshold(
     pairs_val: pd.DataFrame,
     ground_truth_val: pd.DataFrame,
     thresholds: Optional[list[float]] = None,
+    checkpoint_path: Optional[str | Path] = None,
+    resume: bool = True,
 ) -> tuple[float, float]:
     """
     Sweep probability thresholds and return the one that maximises F_0.5
-    on the validation split.
+    on the validation split. Supports loading from/saving to checkpoint.
 
     Returns
     -------
     (best_threshold, best_f05)
     """
+    if checkpoint_path is not None and resume:
+        ckpt = Path(checkpoint_path)
+        if ckpt.is_file() and ckpt.stat().st_size > 0:
+            try:
+                import json
+                with open(ckpt, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                best_t = data["best_threshold"]
+                best_f = data["best_f05"]
+                logger.info("Loaded tuned threshold from %s: threshold=%.2f, val F_0.5=%.4f", ckpt, best_t, best_f)
+                return best_t, best_f
+            except Exception as e:
+                logger.warning("Failed to load threshold checkpoint: %s. Re-tuning.", e)
+
     if thresholds is None:
         thresholds = [round(t, 2) for t in np.arange(0.1, 0.95, 0.05)]
 
@@ -249,6 +408,18 @@ def tune_threshold(
         "Best threshold: %.2f  |  Best F_0.5 (val): %.4f",
         best_threshold, best_f05,
     )
+
+    if checkpoint_path is not None:
+        try:
+            import json
+            ckpt = Path(checkpoint_path)
+            ckpt.parent.mkdir(parents=True, exist_ok=True)
+            with open(ckpt, "w", encoding="utf-8") as f:
+                json.dump({"best_threshold": best_threshold, "best_f05": best_f05}, f, indent=2)
+            logger.info("Saved threshold checkpoint to %s", ckpt)
+        except Exception as e:
+            logger.warning("Failed to save threshold checkpoint: %s", e)
+
     return best_threshold, best_f05
 
 
