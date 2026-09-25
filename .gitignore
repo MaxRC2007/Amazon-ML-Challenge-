@@ -1,0 +1,31 @@
+# --- Data (large, provided; never committed to the source freeze) ---
+dataset/
+output/
+outputs/
+*.tsv
+
+# --- Model / run artifacts ---
+*.pkl
+*.joblib
+*.faiss
+*.npy
+*.npz
+quarantine/
+blocking_train/
+blocking_val/
+blocking_test/
+
+# --- Python caches / build ---
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+
+# --- OS cruft ---
+.DS_Store
+
+# --- Lock file is created on the lab machine after install (separate commit) ---
+requirements-lock.txt
