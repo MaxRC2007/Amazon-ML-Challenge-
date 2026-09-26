@@ -59,6 +59,10 @@ from .validation    import (
     report_diagnostics, loco_evaluate, bucket_errors,
     s1_country_map, source_map, annotate_source,
 )
+from .checkpoint    import (
+    save_dataframe, load_dataframe, save_json, load_json,
+    save_numpy, load_numpy, save_pickle, load_pickle, checkpoint_exists,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,67 +205,168 @@ def _build_model_params(args: argparse.Namespace) -> Optional[dict]:
     return mp or None
 
 
+def _find_validator_script(test_dir: Path) -> Optional[Path]:
+    """Find validate_submission.py from various invocation contexts."""
+    candidates = [
+        Path("utils/validate_submission.py"),
+        Path(__file__).resolve().parents[3] / "utils" / "validate_submission.py",
+        Path(__file__).resolve().parents[2] / "utils" / "validate_submission.py",
+        test_dir.resolve().parent.parent / "utils" / "validate_submission.py",
+        test_dir.resolve().parent / "utils" / "validate_submission.py",
+        Path(__file__).resolve().parents[3] / "student_resource" / "utils" / "validate_submission.py",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p.resolve()
+    return None
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
-    train_dir   = Path(args.train_dir)
-    test_dir    = Path(args.test_dir)
-    output_dir  = Path(args.output_dir)
+    train_dir   = Path(args.train_dir).resolve()
+    test_dir    = Path(args.test_dir).resolve()
+    output_dir  = Path(args.output_dir).resolve()
     quarantine  = output_dir / "quarantine"
 
-    # -----------------------------------------------------------------------
-    # 1. Parse
-    # -----------------------------------------------------------------------
-    logger.info("=== Step 1: Parsing ===")
-    s1_train = load_source(train_dir / "train_source1.tsv", quarantine)
-    s2_train = load_source(train_dir / "train_source2.tsv", quarantine)
-    s3_train = load_source(train_dir / "train_source3.tsv", quarantine)
-    gt_full  = load_ground_truth(train_dir / "train_ground_truth.tsv", quarantine)
+    # Setup checkpoint subdirectories
+    ckpt_root = (Path(args.checkpoint_dir) if args.checkpoint_dir else output_dir / "checkpoints").resolve()
+    ckpt_norm     = ckpt_root / "normalized"
+    ckpt_splits   = ckpt_root / "splits"
+    ckpt_blocking = ckpt_root / "blocking"
+    ckpt_features = ckpt_root / "features"
+    ckpt_model    = ckpt_root / "model"
+    ckpt_tuning   = ckpt_root / "tuning"
+    ckpt_test     = ckpt_root / "test"
 
-    s1_test  = load_source(test_dir / "test_source1.tsv",  quarantine)
-    s2_test  = load_source(test_dir / "test_source2.tsv",  quarantine)
-    s3_test  = load_source(test_dir / "test_source3.tsv",  quarantine)
+    for d in [ckpt_norm, ckpt_splits, ckpt_blocking, ckpt_features, ckpt_model, ckpt_tuning, ckpt_test]:
+        d.mkdir(parents=True, exist_ok=True)
 
-    # -----------------------------------------------------------------------
-    # 2. Normalize
-    # -----------------------------------------------------------------------
-    logger.info("=== Step 2: Normalization ===")
-    for df, name in [
-        (s1_train, "s1_train"), (s2_train, "s2_train"), (s3_train, "s3_train"),
-        (s1_test,  "s1_test"),  (s2_test,  "s2_test"),  (s3_test,  "s3_test"),
-    ]:
-        add_normalized_columns(df)
-        logger.info("Normalized %s: %d rows", name, len(df))
+    resume = args.resume
 
     # -----------------------------------------------------------------------
-    # 3. Validation split
+    # 1. Parse & 2. Normalize (with Checkpointing)
+    # -----------------------------------------------------------------------
+    logger.info("=== Steps 1 & 2: Parsing & Normalization ===")
+    norm_paths = {
+        "s1_train": ckpt_norm / "s1_train.parquet",
+        "s2_train": ckpt_norm / "s2_train.parquet",
+        "s3_train": ckpt_norm / "s3_train.parquet",
+        "gt_full":  ckpt_norm / "gt_full.parquet",
+        "s1_test":  ckpt_norm / "s1_test.parquet",
+        "s2_test":  ckpt_norm / "s2_test.parquet",
+        "s3_test":  ckpt_norm / "s3_test.parquet",
+    }
+    all_norm_exist = all(checkpoint_exists(p) for p in norm_paths.values())
+
+    if resume and all_norm_exist:
+        logger.info("Found all normalized datasets in checkpoint (%s). Loading...", ckpt_norm)
+        s1_train = load_dataframe(norm_paths["s1_train"])
+        s2_train = load_dataframe(norm_paths["s2_train"])
+        s3_train = load_dataframe(norm_paths["s3_train"])
+        gt_full  = load_dataframe(norm_paths["gt_full"])
+        s1_test  = load_dataframe(norm_paths["s1_test"])
+        s2_test  = load_dataframe(norm_paths["s2_test"])
+        s3_test  = load_dataframe(norm_paths["s3_test"])
+        logger.info("Loaded normalized datasets: s1_train=%d, s2_train=%d, s3_train=%d, s1_test=%d, s2_test=%d, s3_test=%d",
+                    len(s1_train), len(s2_train), len(s3_train), len(s1_test), len(s2_test), len(s3_test))
+    else:
+        logger.info("Parsing source TSV files...")
+        s1_train = load_source(train_dir / "train_source1.tsv", quarantine)
+        s2_train = load_source(train_dir / "train_source2.tsv", quarantine)
+        s3_train = load_source(train_dir / "train_source3.tsv", quarantine)
+        gt_full  = load_ground_truth(train_dir / "train_ground_truth.tsv", quarantine)
+
+        s1_test  = load_source(test_dir / "test_source1.tsv",  quarantine)
+        s2_test  = load_source(test_dir / "test_source2.tsv",  quarantine)
+        s3_test  = load_source(test_dir / "test_source3.tsv",  quarantine)
+
+        for df, name in [
+            (s1_train, "s1_train"), (s2_train, "s2_train"), (s3_train, "s3_train"),
+            (s1_test,  "s1_test"),  (s2_test,  "s2_test"),  (s3_test,  "s3_test"),
+        ]:
+            add_normalized_columns(df)
+            logger.info("Normalized %s: %d rows", name, len(df))
+            save_dataframe(df, norm_paths[name])
+
+        save_dataframe(gt_full, norm_paths["gt_full"])
+        logger.info("Normalized datasets checkpointed to %s", ckpt_norm)
+
+    # -----------------------------------------------------------------------
+    # 3. Validation split (with Checkpointing)
     # -----------------------------------------------------------------------
     logger.info("=== Step 3: Train/val split ===")
-    all_s1_ids = gt_full["source1_entity_id"].tolist()
-    train_ids, val_ids = train_test_split(
-        all_s1_ids, test_size=args.val_fraction, random_state=42
-    )
-    gt_train = gt_full[gt_full["source1_entity_id"].isin(set(train_ids))].reset_index(drop=True)
-    gt_val   = gt_full[gt_full["source1_entity_id"].isin(set(val_ids))].reset_index(drop=True)
+    split_paths = {
+        "gt_train":    ckpt_splits / "gt_train.parquet",
+        "gt_val":      ckpt_splits / "gt_val.parquet",
+        "s1_tr_split": ckpt_splits / "s1_tr_split.parquet",
+        "s1_va_split": ckpt_splits / "s1_va_split.parquet",
+    }
+    all_splits_exist = all(checkpoint_exists(p) for p in split_paths.values())
 
-    s1_tr_split = s1_train[s1_train["entity_id"].isin(set(train_ids))].reset_index(drop=True)
-    s1_va_split = s1_train[s1_train["entity_id"].isin(set(val_ids))].reset_index(drop=True)
+    if resume and all_splits_exist:
+        logger.info("Found train/val splits in checkpoint (%s). Loading...", ckpt_splits)
+        gt_train    = load_dataframe(split_paths["gt_train"])
+        gt_val      = load_dataframe(split_paths["gt_val"])
+        s1_tr_split = load_dataframe(split_paths["s1_tr_split"])
+        s1_va_split = load_dataframe(split_paths["s1_va_split"])
+    else:
+        all_s1_ids = gt_full["source1_entity_id"].tolist()
+        train_ids, val_ids = train_test_split(
+            all_s1_ids, test_size=args.val_fraction, random_state=42
+        )
+        gt_train = gt_full[gt_full["source1_entity_id"].isin(set(train_ids))].reset_index(drop=True)
+        gt_val   = gt_full[gt_full["source1_entity_id"].isin(set(val_ids))].reset_index(drop=True)
+
+        s1_tr_split = s1_train[s1_train["entity_id"].isin(set(train_ids))].reset_index(drop=True)
+        s1_va_split = s1_train[s1_train["entity_id"].isin(set(val_ids))].reset_index(drop=True)
+
+        save_dataframe(gt_train, split_paths["gt_train"])
+        save_dataframe(gt_val, split_paths["gt_val"])
+        save_dataframe(s1_tr_split, split_paths["s1_tr_split"])
+        save_dataframe(s1_va_split, split_paths["s1_va_split"])
+        logger.info("Splits checkpointed to %s", ckpt_splits)
 
     logger.info("Train split: %d S1 entities | Val split: %d S1 entities",
-                len(train_ids), len(val_ids))
+                len(s1_tr_split), len(s1_va_split))
 
     # -----------------------------------------------------------------------
     # 4. Stage A — Classical Blocking (train split)
     # -----------------------------------------------------------------------
     logger.info("=== Step 4: Stage A classical blocking (train split) ===")
-    candidates_train_a = run_stage_a(s1_tr_split, s2_train, s3_train)
+    cand_train_a_path = ckpt_blocking / "candidates_train_a.tsv"
+    if resume and checkpoint_exists(cand_train_a_path):
+        logger.info("Found Stage A train candidates at %s. Loading...", cand_train_a_path)
+        candidates_train_a = pd.read_csv(cand_train_a_path, sep="\t", dtype=str).fillna("")
+        if "n_candidates" not in candidates_train_a.columns:
+            candidates_train_a["n_candidates"] = candidates_train_a["candidate_entity_ids"].apply(
+                lambda s: len(str(s).split(",")) if (s and str(s).strip()) else 0
+            )
+    else:
+        candidates_train_a = run_stage_a(s1_tr_split, s2_train, s3_train)
+        candidates_train_a.to_csv(cand_train_a_path, sep="\t", index=False)
 
     # -----------------------------------------------------------------------
     # 5. Recall measurement on validation split
     # -----------------------------------------------------------------------
     logger.info("=== Step 5: Recall ceiling measurement (val split) ===")
-    candidates_val_a = run_stage_a(s1_va_split, s2_train, s3_train)
-    recall_stats = measure_recall(candidates_val_a, gt_val)
+    cand_val_a_path = ckpt_blocking / "candidates_val_a.tsv"
+    recall_stats_path = ckpt_blocking / "recall_stats.json"
+
+    if resume and checkpoint_exists(cand_val_a_path) and checkpoint_exists(recall_stats_path):
+        logger.info("Found Stage A val candidates and recall stats at %s. Loading...", ckpt_blocking)
+        candidates_val_a = pd.read_csv(cand_val_a_path, sep="\t", dtype=str).fillna("")
+        if "n_candidates" not in candidates_val_a.columns:
+            candidates_val_a["n_candidates"] = candidates_val_a["candidate_entity_ids"].apply(
+                lambda s: len(str(s).split(",")) if (s and str(s).strip()) else 0
+            )
+        recall_stats = load_json(recall_stats_path)
+    else:
+        candidates_val_a = run_stage_a(s1_va_split, s2_train, s3_train)
+        candidates_val_a.to_csv(cand_val_a_path, sep="\t", index=False)
+        recall_stats = measure_recall(candidates_val_a, gt_val)
+        save_json(recall_stats, recall_stats_path)
+
     logger.info(
-        "Stage A recall ceiling (val): %.4f  (%d / %d true matches recovered)",
+        "Recall ceiling: %.4f  (%d / %d true matches recovered)",
         recall_stats["recall"],
         recall_stats["n_recovered"],
         recall_stats["n_true_matches"],
@@ -281,12 +386,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
             output_dir=output_dir / "blocking_train",
             embed_threshold=args.embed_threshold,
             run_embedding=True,
+            resume=resume,
         )
         candidates_val = build_candidate_pairs(
             s1_va_split, s2_train, s3_train,
             output_dir=output_dir / "blocking_val",
             embed_threshold=args.embed_threshold,
             run_embedding=True,
+            resume=resume,
         )
     else:
         logger.info("=== Step 6: Stage B skipped ===")
@@ -294,47 +401,108 @@ def run_pipeline(args: argparse.Namespace) -> None:
         candidates_val   = candidates_val_a
 
     # -----------------------------------------------------------------------
-    # 7. Feature matrix
+    # 7. Feature matrix (with Checkpointing)
     # -----------------------------------------------------------------------
     logger.info("=== Step 7: Building feature matrices ===")
+    feat_paths = {
+        "tfidf":        ckpt_features / "tfidf_vec.pkl",
+        "emb_train":    ckpt_features / "emb_map_train.pkl",
+        "emb_val":      ckpt_features / "emb_map_val.pkl",
+        "X_train":      ckpt_features / "X_train.parquet",
+        "X_val":        ckpt_features / "X_val.parquet",
+        "pairs_train":  ckpt_features / "pairs_train.parquet",
+        "pairs_val":    ckpt_features / "pairs_val.parquet",
+    }
+
+    # Combined S2+S3 frame for the TRAIN sources — needed for feature building,
+    # reranking, and error-analysis regardless of whether features are rebuilt
+    # or loaded from checkpoint, so define it unconditionally here.
     sx_train_combined = pd.concat([s2_train, s3_train], ignore_index=True)
 
-    pairs_train = _explode_candidates(candidates_train)
-    pairs_val   = _explode_candidates(candidates_val)
+    if (resume and checkpoint_exists(feat_paths["X_train"]) and
+            checkpoint_exists(feat_paths["X_val"]) and
+            checkpoint_exists(feat_paths["pairs_val"]) and
+            checkpoint_exists(feat_paths["tfidf"])):
+        logger.info("Found feature matrices in checkpoint (%s). Loading...", ckpt_features)
+        X_train_df  = load_dataframe(feat_paths["X_train"])
+        X_val_df    = load_dataframe(feat_paths["X_val"])
+        pairs_train = load_dataframe(feat_paths["pairs_train"])
+        pairs_val   = load_dataframe(feat_paths["pairs_val"])
+        tfidf_vec   = load_pickle(feat_paths["tfidf"])
+    else:
+        pairs_train = _explode_candidates(candidates_train)
+        pairs_val   = _explode_candidates(candidates_val)
 
-    # Fit ONE TF-IDF vectorizer on the full training name corpus and reuse it
-    # for train, val AND test so tfidf_cosine shares a stable vocabulary.
-    tfidf_vec = fit_global_tfidf([
-        s1_train["norm_name"], s2_train["norm_name"], s3_train["norm_name"],
-    ])
+        # Fit ONE TF-IDF vectorizer on the full training name corpus
+        tfidf_vec = fit_global_tfidf([
+            s1_train["norm_name"], s2_train["norm_name"], s3_train["norm_name"],
+        ])
+        save_pickle(tfidf_vec, feat_paths["tfidf"])
 
-    # Optional embedding cosine maps (only when Stage B is enabled).
-    emb_map_train = emb_map_val = None
-    if args.run_embedding:
-        emb_map_train = compute_embedding_cosine_map(pairs_train, s1_tr_split, sx_train_combined)
-        emb_map_val   = compute_embedding_cosine_map(pairs_val,   s1_va_split, sx_train_combined)
+        emb_map_train = emb_map_val = None
+        if args.run_embedding:
+            emb_map_train = compute_embedding_cosine_map(
+                pairs_train, s1_tr_split, sx_train_combined,
+                cache_path=feat_paths["emb_train"], resume=resume,
+            )
+            emb_map_val   = compute_embedding_cosine_map(
+                pairs_val,   s1_va_split, sx_train_combined,
+                cache_path=feat_paths["emb_val"], resume=resume,
+            )
 
-    X_train_df = build_feature_matrix(
-        pairs_train, s1_tr_split, sx_train_combined,
-        embedding_cosine_map=emb_map_train, tfidf_vectorizer=tfidf_vec,
-    )
-    X_val_df   = build_feature_matrix(
-        pairs_val, s1_va_split, sx_train_combined,
-        embedding_cosine_map=emb_map_val, tfidf_vectorizer=tfidf_vec,
-    )
+        X_train_df = build_feature_matrix(
+            pairs_train, s1_tr_split, sx_train_combined,
+            embedding_cosine_map=emb_map_train, tfidf_vectorizer=tfidf_vec,
+        )
+        X_val_df   = build_feature_matrix(
+            pairs_val, s1_va_split, sx_train_combined,
+            embedding_cosine_map=emb_map_val, tfidf_vectorizer=tfidf_vec,
+        )
+
+        save_dataframe(X_train_df, feat_paths["X_train"])
+        save_dataframe(X_val_df, feat_paths["X_val"])
+        save_dataframe(pairs_train, feat_paths["pairs_train"])
+        save_dataframe(pairs_val, feat_paths["pairs_val"])
+        logger.info("Feature matrices checkpointed to %s", ckpt_features)
 
     # -----------------------------------------------------------------------
-    # 8. Build labels + train LightGBM
+    # 8. Build labels + train LightGBM (with Checkpointing & Resume)
     # -----------------------------------------------------------------------
     logger.info("=== Step 8: Training LightGBM ===")
-    gt_set = _gt_pair_set(gt_train)
-    y_train = _label_pairs(X_train_df, gt_set)
+    y_fit_path = ckpt_features / "y_fit.npy"
+    X_fit_path = ckpt_features / "X_fit.parquet"
 
     # Per-source group labels ('S2'/'S3') for optional per-group thresholding
     # and for LOCO's per-source policy. Country map keys the LOCO folds.
-    smap_train      = source_map(s2_train, s3_train)
-    country_map_all = s1_country_map(s1_train)
+    smap_train       = source_map(s2_train, s3_train)
+    country_map_all  = s1_country_map(s1_train)
     src_labels_train = annotate_source(pairs_train, smap_train)
+
+    # Full (pre-downsample) labels — needed both for the LOCO diagnostic and to
+    # build the downsampled (X_fit, y_fit) training set below.
+    gt_set  = _gt_pair_set(gt_train)
+    y_train = _label_pairs(X_train_df, gt_set)
+
+    if resume and checkpoint_exists(y_fit_path) and checkpoint_exists(X_fit_path):
+        logger.info("Found training features and labels in checkpoint. Loading...")
+        X_fit = load_dataframe(X_fit_path)
+        y_fit = load_numpy(y_fit_path)
+    else:
+
+        # Downsample negatives for training
+        pos_mask  = y_train == 1
+        neg_mask  = y_train == 0
+        n_pos     = pos_mask.sum()
+        max_neg   = n_pos * args.neg_ratio
+        neg_idx   = np.where(neg_mask)[0]
+        rng       = np.random.default_rng(42)
+        chosen_neg = rng.choice(neg_idx, size=min(max_neg, len(neg_idx)), replace=False)
+        keep = np.concatenate([np.where(pos_mask)[0], chosen_neg])
+
+        X_fit = X_train_df.iloc[keep].reset_index(drop=True)
+        y_fit = y_train[keep]
+        save_dataframe(X_fit, X_fit_path)
+        save_numpy(y_fit, y_fit_path)
 
     # -----------------------------------------------------------------------
     # 8b. [Optional] LOCO — unseen-country transfer diagnostic
@@ -349,26 +517,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
             calib_method=(args.calib_method if args.calibrate else "isotonic"),
         )
         if args.france_margin <= 0.0:
-            # No explicit override → adopt the LOCO-recommended conservative
-            # margin (largest positive threshold shift a held-out country needed).
             france_margin = float(loco["recommended_conservative_margin"])
             logger.info("LOCO-derived France-robust margin: +%.3f (applied to final threshold)",
                         france_margin)
 
-    # Downsample negatives for training
-    pos_mask  = y_train == 1
-    neg_mask  = y_train == 0
-    n_pos     = pos_mask.sum()
-    max_neg   = n_pos * args.neg_ratio
-    neg_idx   = np.where(neg_mask)[0]
-    rng       = np.random.default_rng(42)
-    chosen_neg = rng.choice(neg_idx, size=min(max_neg, len(neg_idx)), replace=False)
-    keep = np.concatenate([np.where(pos_mask)[0], chosen_neg])
-
-    X_fit = X_train_df.iloc[keep].reset_index(drop=True)
-    y_fit = y_train[keep]
-
-    clf = train(X_fit, y_fit, model_params=_build_model_params(args))
+    clf = train(
+        X_fit, y_fit,
+        model_params=_build_model_params(args),
+        checkpoint_dir=ckpt_model,
+        checkpoint_freq=args.checkpoint_freq,
+        resume=resume,
+    )
     save_model(clf, output_dir / "model.pkl")
 
     # -----------------------------------------------------------------------
@@ -381,7 +540,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     if not use_advanced:
         logger.info("=== Step 9: Threshold tuning (val split) — baseline path ===")
-        best_threshold, best_f05 = tune_threshold(clf, X_val_df, pairs_val, gt_val)
+        threshold_ckpt_path = ckpt_tuning / "threshold_checkpoint.json"
+        best_threshold, best_f05 = tune_threshold(
+            clf, X_val_df, pairs_val, gt_val,
+            checkpoint_path=threshold_ckpt_path,
+            resume=resume,
+        )
         logger.info("Best threshold: %.2f | Val F_0.5: %.4f", best_threshold, best_f05)
 
         # Diagnostic-only error bucketing on the baseline decision (no change to output).
@@ -453,64 +617,82 @@ def run_pipeline(args: argparse.Namespace) -> None:
             )
 
     # -----------------------------------------------------------------------
-    # 10. Inference on TEST set
+    # 10. Inference on TEST set (with Checkpointing)
     # -----------------------------------------------------------------------
     logger.info("=== Step 10: Test set inference ===")
-    # Free training-side frames before loading the (large) test candidate set
-    # into the feature builder — keeps peak RAM down on the full dataset.
-    del (s1_train, s2_train, s3_train, sx_train_combined,
-         X_train_df, X_val_df, X_fit, pairs_train, pairs_val,
-         candidates_train, candidates_val, candidates_train_a, candidates_val_a,
-         s1_tr_split, s1_va_split, gt_set)
-    gc.collect()
+    test_out_matching = output_dir / "matching_results.tsv"
+    test_out_candidate = output_dir / "candidate_pairs.tsv"
 
-    sx_test_combined = pd.concat([s2_test, s3_test], ignore_index=True)
-
-    candidates_test = build_candidate_pairs(
-        s1_test, s2_test, s3_test,
-        output_dir=output_dir / "blocking_test",
-        embed_threshold=args.embed_threshold if args.run_embedding else 0,
-        run_embedding=args.run_embedding,
-    )
-
-    pairs_test = _explode_candidates(candidates_test)
-    emb_map_test = None
-    if args.run_embedding:
-        emb_map_test = compute_embedding_cosine_map(pairs_test, s1_test, sx_test_combined)
-    X_test_df  = build_feature_matrix(
-        pairs_test, s1_test, sx_test_combined,
-        embedding_cosine_map=emb_map_test, tfidf_vectorizer=tfidf_vec,
-    )
-
-    if not use_advanced:
-        preds_test = predict(clf, X_test_df, threshold=best_threshold)
+    if resume and checkpoint_exists(test_out_matching) and checkpoint_exists(test_out_candidate):
+        logger.info("Found existing matching_results.tsv and candidate_pairs.tsv at %s. Skipping test inference.", output_dir)
     else:
-        raw_test    = clf.predict_proba(X_test_df[FEATURE_COLS])[:, 1]
-        test_scores = cal.transform(raw_test)
-        smap_test   = source_map(s2_test, s3_test)
-        gl_test     = annotate_source(pairs_test, smap_test) if args.per_source_threshold else None
-        if args.rerank:
-            test_scores, _ = rerank_borderline(
-                test_scores, pairs_test, s1_test, sx_test_combined,
-                adj_policy.global_threshold,
-                band=args.rerank_band, model_name=args.rerank_model,
-            )
-        preds_test = apply_policy(test_scores, pairs_test, adj_policy, gl_test)
+        # Free training-side frames before loading the test set
+        del (s1_train, s2_train, s3_train,
+             X_train_df, X_val_df, X_fit, pairs_train, pairs_val,
+             candidates_train, candidates_val, candidates_train_a, candidates_val_a,
+             s1_tr_split, s1_va_split)
+        gc.collect()
 
-    _write_output(
-        pairs_test, preds_test,
-        s1_all_ids=s1_test["entity_id"].tolist(),
-        output_dir=output_dir,
-        candidates=candidates_test,
-        split="test",
-    )
+        sx_test_combined = pd.concat([s2_test, s3_test], ignore_index=True)
+
+        candidates_test = build_candidate_pairs(
+            s1_test, s2_test, s3_test,
+            output_dir=output_dir / "blocking_test",
+            embed_threshold=args.embed_threshold if args.run_embedding else 0,
+            run_embedding=args.run_embedding,
+            resume=resume,
+        )
+
+        pairs_test = _explode_candidates(candidates_test)
+        X_test_path = ckpt_test / "X_test.parquet"
+        emb_test_path = ckpt_test / "emb_map_test.pkl"
+
+        if resume and checkpoint_exists(X_test_path):
+            logger.info("Found test feature matrix in checkpoint (%s). Loading...", X_test_path)
+            X_test_df = load_dataframe(X_test_path)
+        else:
+            emb_map_test = None
+            if args.run_embedding:
+                emb_map_test = compute_embedding_cosine_map(
+                    pairs_test, s1_test, sx_test_combined,
+                    cache_path=emb_test_path, resume=resume,
+                )
+            X_test_df = build_feature_matrix(
+                pairs_test, s1_test, sx_test_combined,
+                embedding_cosine_map=emb_map_test, tfidf_vectorizer=tfidf_vec,
+            )
+            save_dataframe(X_test_df, X_test_path)
+
+        if not use_advanced:
+            preds_test = predict(clf, X_test_df, threshold=best_threshold)
+        else:
+            raw_test    = clf.predict_proba(X_test_df[FEATURE_COLS])[:, 1]
+            test_scores = cal.transform(raw_test)
+            smap_test   = source_map(s2_test, s3_test)
+            gl_test     = annotate_source(pairs_test, smap_test) if args.per_source_threshold else None
+            if args.rerank:
+                test_scores, _ = rerank_borderline(
+                    test_scores, pairs_test, s1_test, sx_test_combined,
+                    adj_policy.global_threshold,
+                    band=args.rerank_band, model_name=args.rerank_model,
+                )
+            preds_test = apply_policy(test_scores, pairs_test, adj_policy, gl_test)
+
+        _write_output(
+            pairs_test, preds_test,
+            s1_all_ids=s1_test["entity_id"].tolist(),
+            output_dir=output_dir,
+            candidates=candidates_test,
+            split="test",
+        )
 
     # -----------------------------------------------------------------------
     # 11. Validate submission
     # -----------------------------------------------------------------------
     logger.info("=== Step 11: Validating submission ===")
-    validate_script = Path("utils/validate_submission.py")
-    if validate_script.exists():
+    validate_script = _find_validator_script(test_dir)
+    if validate_script is not None:
+        logger.info("Running validator from %s ...", validate_script)
         result = subprocess.run(
             [
                 sys.executable, str(validate_script),
@@ -527,7 +709,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         else:
             logger.error("Validator: FAIL ✗\n%s", result.stderr)
     else:
-        logger.warning("validate_submission.py not found — skipping validation.")
+        logger.warning("validate_submission.py not found in search paths — skipping validation.")
 
     logger.info(
         "Pipeline complete.  Val F_0.5=%.4f  threshold=%.2f",
@@ -550,6 +732,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--neg-ratio",       type=int,   default=3,   help="Negative-to-positive ratio for training")
     p.add_argument("--embed-threshold", type=int,   default=0,   help="Stage B gate: -1=embed all S1 entities (GPU full-corpus mode); >=0=only embed entities with <=N classical candidates (CPU gated mode)")
     p.add_argument("--run-embedding",   action="store_true",      help="Enable Stage B embedding ANN")
+
+    # --- Checkpoint / resume infrastructure ---
+    p.add_argument("--resume",          dest="resume", action="store_true", default=True, help="Resume from checkpoints if available (default: True)")
+    p.add_argument("--no-resume",       dest="resume", action="store_false", help="Ignore checkpoints and recompute from scratch")
+    p.add_argument("--checkpoint-dir",  default=None,            help="Directory to store intermediate checkpoints (default: <output-dir>/checkpoints)")
+    p.add_argument("--checkpoint-freq", type=int,   default=25,  help="Save model checkpoint every N trees (default: 25)")
 
     # --- Optional precision-first decision levers (all OFF by default; with
     #     none set, steps 9–10 reproduce the frozen baseline exactly). ---
