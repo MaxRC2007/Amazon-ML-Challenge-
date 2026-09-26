@@ -249,6 +249,28 @@ def tune_threshold(
         "Best threshold: %.2f  |  Best F_0.5 (val): %.4f",
         best_threshold, best_f05,
     )
+
+    # Diagnostic: Calculate false-merge rate on singletons for the best threshold
+    best_preds = (probas >= best_threshold).astype(int)
+    
+    # Map back to s1_id to see which singletons got merged
+    merged_s1_ids = set(pairs_val.loc[best_preds == 1, "source1_entity_id"])
+    
+    true_singletons = 0
+    false_merged_singletons = 0
+    for row in ground_truth_val.itertuples(index=False):
+        # A true singleton has empty or missing matched_entity_ids
+        if pd.isna(row.matched_entity_ids) or str(row.matched_entity_ids).strip() == "":
+            true_singletons += 1
+            if row.source1_entity_id in merged_s1_ids:
+                false_merged_singletons += 1
+                
+    singleton_fm_rate = (false_merged_singletons / true_singletons) if true_singletons > 0 else 0.0
+    logger.info(
+        "Validation Singleton diagnostics: %d true singletons, %d false-merged (Error rate: %.2f%%)",
+        true_singletons, false_merged_singletons, singleton_fm_rate * 100
+    )
+
     return best_threshold, best_f05
 
 

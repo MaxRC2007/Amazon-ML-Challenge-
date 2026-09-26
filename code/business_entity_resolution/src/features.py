@@ -19,8 +19,15 @@ Address features:
 Metadata features:
   8. country_match          — 1.0 if country labels are identical, else 0.0
 
+Hard-bucket features (model the top-of-leaderboard failure modes):
+  9.  name_containment      — |A∩B| / min(|A|,|B|) on name token sets (sub-brands)
+  10. acronym_match         — 1.0 if one name is the initialism of the other
+  11. house_number_match    — numeric street-number agreement (1/0/-1 sentinel)
+  12. name_len_ratio        — min/max character length ratio of the two names
+  13. name_addr_mismatch    — chain/franchise trap: name overlap × (1 − addr overlap)
+
 Embedding features (optional, 0.0 when Stage B not run):
-  9. embedding_cosine       — cosine similarity from multilingual embedding model
+  14. embedding_cosine      — cosine similarity from multilingual embedding model
 
 Public API:
     build_feature_matrix(pairs, s1, s2s3_combined) -> pd.DataFrame
@@ -29,6 +36,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import re as _re
 from typing import Optional
 
 import numpy as np
@@ -37,6 +45,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
+
+# Any run of digits — used for house/street-number extraction from addresses.
+_DIGIT_RUN_RE = _re.compile(r"\d+")
 
 try:
     from rapidfuzz import fuzz as _fuzz
@@ -82,6 +93,79 @@ def _token_set_jaccard(a: str, b: str) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
+
+
+# ---------------------------------------------------------------------------
+# Hard-bucket features
+# These explicitly model the failure modes that decide the top-of-leaderboard
+# margin: name containment (sub-brands), acronym/initialism equivalence,
+# house-number agreement (a cross-lingual precision signal), name length
+# ratio, and the chain/franchise trap (identical name, different address =>
+# usually a DIFFERENT entity, i.e. a strong non-merge signal).
+# All are pure-python and vectorised via list comprehensions — no new deps.
+# ---------------------------------------------------------------------------
+
+def _containment(a_set: str, b_set: str) -> float:
+    """
+    Token-set containment: |A ∩ B| / min(|A|, |B|).
+    Returns 1.0 when one name's tokens are a subset of the other's
+    ("reliance" ⊂ "reliance digital"), which plain Jaccard understates.
+    Inputs are space-joined deduped token strings (norm_name_set).
+    """
+    sa = set(a_set.split())
+    sb = set(b_set.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+def _acronym_match(a: str, b: str) -> float:
+    """
+    1.0 if one side is the initialism of the other
+    ("ibm" ↔ "international business machines"), else 0.0.
+    Inputs are normalized (lowercased, space-tokenised) names.
+    """
+    ta, tb = a.split(), b.split()
+    if not ta or not tb:
+        return 0.0
+
+    def _acro(toks: list[str]) -> str:
+        return "".join(t[0] for t in toks if t)
+
+    if len(ta) == 1 and len(tb) >= 2 and ta[0] == _acro(tb):
+        return 1.0
+    if len(tb) == 1 and len(ta) >= 2 and tb[0] == _acro(ta):
+        return 1.0
+    return 0.0
+
+
+def _house_numbers(addr: str) -> set[str]:
+    return set(_DIGIT_RUN_RE.findall(addr))
+
+
+def _house_number_match(a_addr: str, b_addr: str) -> float:
+    """
+    Numeric street/house-number agreement between two addresses.
+      1.0  → both have digits and at least one overlaps  (strong same-place)
+      0.0  → both have digits but none overlap            (different place)
+     -1.0  → at least one side has no digits              (unknown / missing)
+    A sentinel-for-missing scheme LightGBM splits on cleanly; survives across
+    languages because digits are script-invariant.
+    """
+    na, nb = _house_numbers(a_addr), _house_numbers(b_addr)
+    if not na or not nb:
+        return -1.0
+    return 1.0 if (na & nb) else 0.0
+
+
+def _len_ratio(a: str, b: str) -> float:
+    """Character length ratio min/max of two normalized names (0–1)."""
+    la, lb = len(a), len(b)
+    if la == 0 and lb == 0:
+        return 1.0
+    if la == 0 or lb == 0:
+        return 0.0
+    return min(la, lb) / max(la, lb)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +253,9 @@ def build_feature_matrix(
         return pd.DataFrame(columns=[
             "source1_entity_id", "candidate_entity_id", "token_set_jaccard",
             "levenshtein_ratio", "token_sort_ratio", "lcs_ratio", "tfidf_cosine",
-            "address_token_jaccard", "address_levenshtein", "country_match", "embedding_cosine"
+            "address_token_jaccard", "address_levenshtein", "country_match",
+            "name_containment", "acronym_match", "house_number_match",
+            "name_len_ratio", "name_addr_mismatch", "embedding_cosine"
         ])
 
     # ---- 1. Fast alignment via pandas merge ----
@@ -230,6 +316,18 @@ def build_feature_matrix(
     address_levenshtein = [_levenshtein_ratio(a, b) for a, b in zip(s1_na_list, sx_na_list)]
     country_match = [1.0 if a == b else 0.0 for a, b in zip(s1_cty_list, sx_cty_list)]
 
+    # ---- 4b. Hard-bucket features (sub-brands, acronyms, chains, house #) ----
+    name_containment  = [_containment(a, b)        for a, b in zip(s1_nse_list, sx_nse_list)]
+    acronym_match     = [_acronym_match(a, b)      for a, b in zip(s1_nn_list, sx_nn_list)]
+    house_number_match = [_house_number_match(a, b) for a, b in zip(s1_na_list, sx_na_list)]
+    name_len_ratio    = [_len_ratio(a, b)          for a, b in zip(s1_nn_list, sx_nn_list)]
+    # Chain/franchise trap: identical name + divergent address => likely a
+    # DIFFERENT entity. High when name overlap is strong but address overlap
+    # is weak; the tree learns this as a non-merge signal.
+    _tsj = np.asarray(token_set_jaccard, dtype="float64")
+    _atj = np.asarray(address_token_jaccard, dtype="float64")
+    name_addr_mismatch = (_tsj * (1.0 - _atj)).tolist()
+
     if embedding_cosine_map:
         embedding_cosine = [embedding_cosine_map.get((a, b), 0.0) for a, b in zip(s1_ids, sx_ids)]
     else:
@@ -247,6 +345,11 @@ def build_feature_matrix(
         "address_token_jaccard": address_token_jaccard,
         "address_levenshtein": address_levenshtein,
         "country_match": country_match,
+        "name_containment": name_containment,
+        "acronym_match": acronym_match,
+        "house_number_match": house_number_match,
+        "name_len_ratio": name_len_ratio,
+        "name_addr_mismatch": name_addr_mismatch,
         "embedding_cosine": embedding_cosine,
     })
 
@@ -263,6 +366,11 @@ FEATURE_COLS = [
     "address_token_jaccard",
     "address_levenshtein",
     "country_match",
+    "name_containment",
+    "acronym_match",
+    "house_number_match",
+    "name_len_ratio",
+    "name_addr_mismatch",
     "embedding_cosine",
 ]
 

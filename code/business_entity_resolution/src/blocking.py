@@ -330,7 +330,7 @@ def run_stage_b(
     s3: pd.DataFrame,
     weak_s1_ids: set[str],
     output_dir: str | Path,
-    model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+    model_name: str = "sentence-transformers/LaBSE",
     batch_size: int = 512,
     top_k: int = 10,
 ) -> pd.DataFrame:
